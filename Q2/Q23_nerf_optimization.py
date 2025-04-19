@@ -7,21 +7,49 @@ import time
 import imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
+
 from nerf.config_parser import add_config_arguments
 from nerf.network_grid import NeRFNetwork
 from nerf.provider import NeRFDataset
 from optimizer import Adan
 from PIL import Image
 from SDS import SDS
+import torchvision.transforms 
 from utils import prepare_embeddings, seed_everything
+import matplotlib.pyplot as plt
 
+# AH: add loss plots
+def save_training_loss_plot(losses, cur_step, save_path):
+    avg_interval = 10
+    # Compute averages every `avg_interval` steps
+    avg_losses = [np.mean(np.array(losses[i:min(i + avg_interval, len(losses) - 1)])) for i in range(0, len(losses), avg_interval)]
+    avg_steps = np.array([i for i in range(len(avg_losses))]) * avg_interval
+    #print("losses: ", losses)
+    #print("avg losses: ", avg_losses)
+    #print("avg steps: ", avg_steps)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(avg_steps, avg_losses, label="Training Loss", color="blue")
+    plt.xlabel("Training Steps")
+    plt.ylabel("Loss")
+    plt.title(f"Training Loss Averaged over {avg_interval} steps until Step {cur_step}")
+    plt.grid(True)
+
+    # Save the plot
+    #filename = f"loss_vs_steps_{cur_step}.png"
+    #plt.savefig(f"{save_path}/{filename}")
+    plt.savefig(save_path)
+    plt.close()
+
+    print(f"Saved plot {save_path}")
 
 def optimize_nerf(
     sds,
     prompt,
     neg_prompt="",
     device="cpu",
-    log_interval=20,
+    log_interval=4,
     args=None,
 ):
     """
@@ -67,14 +95,18 @@ def optimize_nerf(
     ).dataloader(batch_size=1)
 
     # Step 5. Training loop
-    loss_dict = {}
+    epoch_loss_dict = {} # record 1 loss per epoch
+    step_loss_dict = {} # record the loss for each step
     global_step = 0
     # create logging and saving directories
-    checkpoint_path = osp.join(sds.output_dir, f"nerf_checkpoint.pth")
     os.makedirs(f"{sds.output_dir}/images", exist_ok=True)
     os.makedirs(f"{sds.output_dir}/videos", exist_ok=True)
+    os.makedirs(f"{sds.output_dir}/checkpoints", exist_ok=True)
+    os.makedirs(f"{sds.output_dir}/loss_graphs", exist_ok=True)
+    checkpoint_path = osp.join(sds.output_dir, f"checkpoints/nerf_checkpoint")
 
     max_epoch = np.ceil(args.iters / len(train_loader)).astype(np.int32)
+
     for epoch in range(max_epoch):
         model.train()
         for data in train_loader:
@@ -146,6 +178,11 @@ def optimize_nerf(
                 binarize=False,
                 max_ray_batch=args.max_ray_batch,
             )
+
+            # TODO AH: Extra debug stuff!!!!!
+            if global_step % 100 == 0:
+                print(f"Mean alpha (opacity): {outputs['weights'].mean().item():.6f}")
+
             pred_rgb = (
                 outputs["image"].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
             )  # [B, 3, H, W]
@@ -159,13 +196,27 @@ def optimize_nerf(
             if not args.view_dep_text:
                 text_cond = embeddings["default"]
             else:
-                ### YOUR CODE HERE ###
-                pass
+                #print("Encoding text with view dependency!!")
+                # Create text embedding with view dependency.
+                embeddings_w_view = prepare_embeddings(sds, prompt, neg_prompt, view_dependent=True)
 
+                if -45 <= azimuth <= 45:
+                    text_cond = embeddings_w_view['front']
+                elif azimuth <=-135 or azimuth >= 135:
+                    text_cond = embeddings_w_view['back']
+                else:
+                    text_cond = embeddings_w_view['side']
   
             ### YOUR CODE HERE ###
-            latents = 
-            loss = 
+            pred_rgb = F.interpolate(pred_rgb, size=(512, 512), mode='bilinear', align_corners=False)
+            latents = sds.encode_imgs(pred_rgb)
+
+            # Compute SDS loss either in pixel space or latent space
+            if args.pixel_space_loss:
+                #print("Using pixel space SDS loss!!!")
+                loss = sds.sds_loss(latents, text_cond, text_embeddings_uncond=text_uncond, pixel_space_loss=True, pred_rgb=pred_rgb)
+            else:
+                loss = sds.sds_loss(latents, text_cond, text_embeddings_uncond=text_uncond, pixel_space_loss=False)
 
             # regularizations
             if args.lambda_entropy > 0:
@@ -194,9 +245,10 @@ def optimize_nerf(
             lr_scheduler.step()
 
             # Log
+            step_loss_dict[global_step] = loss.item()
             print(f"Epoch {epoch}, global_step {global_step}, loss {loss.item()}")
             if global_step % 100 == 0:
-                loss_dict[global_step] = loss.item()
+                epoch_loss_dict[global_step] = loss.item()
                 # save the nerf rendering as the logging output, instead of the decoded latent
                 imgs = (
                     pred_rgb.detach().cpu().permute(0, 2, 3, 1).numpy()
@@ -210,15 +262,23 @@ def optimize_nerf(
 
         # Save checkpoint
         if epoch % log_interval == 0 and global_step > 0:
+            cur_checkpoint_path = checkpoint_path + f"_{epoch}.pth"
             torch.save(
                 {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                 },
-                checkpoint_path,
+                cur_checkpoint_path,
             )
+            print(f"-- Saved checkpiont to {cur_checkpoint_path}!")
 
+        # Save loss plot.
+        if epoch % log_interval == 0 and global_step > 10:
+             save_path = osp.join(sds.output_dir, f"loss_graphs/nerf_training_loss_epoch{epoch}_step{global_step}.png")
+             save_training_loss_plot(list(step_loss_dict.values()), global_step, save_path)
+
+        # Save test prediction for this epoch
         if epoch % log_interval == 0 or epoch == max_epoch - 1:
             model.eval()
             all_preds = []
@@ -275,7 +335,7 @@ def optimize_nerf(
             all_preds = np.stack(all_preds, axis=0)
             all_preds_depth = np.stack(all_preds_depth, axis=0)
             # save the video
-            imageio.mimwrite(
+            '''imageio.mimwrite(
                 os.path.join(sds.output_dir, "videos", f"rgb_ep_{epoch}.mp4"),
                 all_preds,
                 fps=25,
@@ -288,12 +348,26 @@ def optimize_nerf(
                 fps=25,
                 quality=8,
                 macro_block_size=1,
+            )'''
+            imageio.mimwrite(
+                os.path.join(sds.output_dir, "videos", f"rgb_ep_{epoch}.gif"),
+                all_preds,
+                fps=25,
+                quality=8,
+                macro_block_size=1,
+            )
+            imageio.mimwrite(
+                os.path.join(sds.output_dir, "videos", f"depth_ep_{epoch}.gif"),
+                all_preds_depth,
+                fps=25,
+                quality=8,
+                macro_block_size=1,
             )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prompt", type=str, default="a hamburger")
+    parser.add_argument("--prompt", type=str, default="a pink vase with pink flowers")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="output")
     parser.add_argument("--loss_scaling", type=int, default=1)
@@ -301,14 +375,17 @@ if __name__ == "__main__":
     ### YOUR CODE HERE ###
     # You wil need to tune the following parameters to obtain good NeRF results
     ### regularizations
-    parser.add_argument('--lambda_entropy', type=float, default=0, help="loss scale for alpha entropy")
-    parser.add_argument('--lambda_orient', type=float, default=0, help="loss scale for orientation")
-    ### shading options
-    parser.add_argument('--latent_iter_ratio', type=float, default=0, help="training iters that only use albedo shading")
+    parser.add_argument('--lambda_entropy', type=float, default=1e-3, help="loss scale for alpha entropy")
+    parser.add_argument('--lambda_orient', type=float, default=1e-2, help="loss scale for orientation")
 
+    ### shading options
+    parser.add_argument('--latent_iter_ratio', type=float, default=0.2, help="training iters that only use albedo shading")
+
+    ### AH: add option to run SDS loss in pixel space!
+    parser.add_argument('--pixel_space_loss', type=int, default=0, help="if True then SDS loss is computed in pixel space not latent space")
 
     parser.add_argument(
-        "--postfix", type=str, default="", help="Postfix for the output directory"
+        "--postfix", type=str, default="_[with_view]", help="Postfix for the output directory"
     )
     parser.add_argument(
         "--view_dep_text",

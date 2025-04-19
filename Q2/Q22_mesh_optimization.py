@@ -1,140 +1,313 @@
 import argparse
 import os
 import os.path as osp
+import random
 import time
 
+import imageio
 import numpy as np
-import pytorch3d
 import torch
-from implicit import ColorField
+from nerf.config_parser import add_config_arguments
+from nerf.network_grid import NeRFNetwork
+from nerf.provider import NeRFDataset
+from optimizer import Adan
 from PIL import Image
-from pytorch3d.renderer import (
-    FoVPerspectiveCameras,
-    TexturesVertex,
-    look_at_view_transform,
-)
 from SDS import SDS
-from tqdm import tqdm
-from utils import (
-    get_cosine_schedule_with_warmup,
-    get_mesh_renderer_soft,
-    init_mesh,
-    prepare_embeddings,
-    render_360_views,
-    seed_everything,
-)
+from utils import prepare_embeddings, seed_everything
 
 
-def optimize_mesh_texture(
+def optimize_nerf(
     sds,
-    mesh_path,
     prompt,
     neg_prompt="",
     device="cpu",
-    log_interval=100,
-    save_mesh=True,
+    log_interval=20,
     args=None,
 ):
     """
-    Optimize the texture map of a mesh to match the prompt.
+    Optimize the view for a NeRF model to match the prompt.
     """
+
     # Step 1. Create text embeddings from prompt
-    embeddings = prepare_embeddings(sds, prompt, neg_prompt, view_dependent=False)
-    sds.text_encoder.to("cpu")  # free up GPU memory
-    torch.cuda.empty_cache()
+    embeddings = prepare_embeddings(sds, prompt, neg_prompt, view_dependent=args.view_dep_text)
 
-    # Step 2. Load the mesh
-    mesh, vertices, faces, aux = init_mesh(mesh_path, device=device)
-    vertices = vertices.unsqueeze(0).to(device)  # (N_v, 3) -> (1, N_v, 3)
-    faces = faces.unsqueeze(0).to(device)  # (N_f, 3) -> (1, N_f, 3)
+    # Step 2. Set up NeRF model
+    model = NeRFNetwork(args).to(device)
 
-    # Step 2.1 Initialize a randome texture map (optimizable parameter)
-    # create a texture field with implicit function
-    color_field = ColorField().to(device)  # input (1, N_v, xyz) -> output (1, N_v, rgb)
-    mesh = pytorch3d.structures.Meshes(
-        verts=vertices,
-        faces=faces,
-        textures=TexturesVertex(verts_features=color_field(vertices)),
+    # Step 3. Create optimizer and training parameters
+    lr = 1e-3
+    optimizer = Adan(
+        model.parameters(),
+        lr=5 * lr,
+        eps=1e-8,
+        weight_decay=2e-5,
+        max_grad_norm=5.0,
+        foreach=False,
     )
-    mesh = mesh.to(device)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 1)
+    if args.loss_scaling:
+        scaler = torch.cuda.amp.GradScaler()
 
-    # Step 3.1 Initialize the renderer
-    lights = pytorch3d.renderer.PointLights(location=[[0, 0, -3]], device=device)
-    renderer = get_mesh_renderer_soft(image_size=512, device=device, lights=lights)
+    # Step 4. Load the dataset
+    train_loader = NeRFDataset(
+        args,
+        device=device,
+        type="train",
+        H=args.h,
+        W=args.w,
+        size=args.dataset_size_train * args.batch_size,
+    ).dataloader()
+    test_loader = NeRFDataset(
+        args,
+        device=device,
+        type="test",
+        H=args.h,
+        W=args.w,
+        size=args.dataset_size_test,
+    ).dataloader(batch_size=1)
 
-    # For logging purpose, render 360 views of the initial mesh
-    if save_mesh:
-        render_360_views(
-            mesh.detach(),
-            renderer,
-            device=device,
-            output_path=osp.join(sds.output_dir, "initial_mesh.gif"),
-        )
-
-    # Step 3.2. Initialize the cameras
-    # check the size of the mesh so that it is in the field of view
-    print(
-        f"check mesh range: {vertices.min()}, {vertices.max()}, center {vertices.mean(1)}"
-    )
-
-    ### YOUR CODE HERE ###
-    # create a list of query cameras as the training set
-    # Note: to create the dataset, you can either pre-define a list of query cameras as below or randomly sample a camera pose on the fly in the training loop.
-    query_cameras = [] # optional
-
-    # Step 4. Create optimizer training parameters
-    optimizer = torch.optim.AdamW(color_field.parameters(), lr=5e-4, weight_decay=0)
-    total_iter = 2000
-    scheduler = get_cosine_schedule_with_warmup(optimizer, 100, int(total_iter * 1.5))
-
-    # Step 5. Training loop to optimize the texture map
+    # Step 5. Training loop
     loss_dict = {}
-    for i in tqdm(range(total_iter)):
-        # Initialize optimizer
-        optimizer.zero_grad()
+    global_step = 0
+    # create logging and saving directories
+    checkpoint_path = osp.join(sds.output_dir, f"nerf_checkpoint.pth")
+    os.makedirs(f"{sds.output_dir}/images", exist_ok=True)
+    os.makedirs(f"{sds.output_dir}/videos", exist_ok=True)
 
-        # Update the textures
-        mesh.textures = TexturesVertex(verts_features=color_field(vertices))
+    max_epoch = np.ceil(args.iters / len(train_loader)).astype(np.int32)
+    for epoch in range(max_epoch):
+        model.train()
+        for data in train_loader:
+            global_step += 1
 
-        ### YOUR CODE HERE ###
-
-        # Forward pass
-        # Render a randomly sampled camera view to optimize in this iteration
-        rend = 
-        # Encode the rendered image to latents
-        latents = 
-        # Compute the loss
-        loss =
-
-
-
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        # clamping the latents to avoid over saturation
-        latents.data = latents.data.clip(-1, 1)
-        if i % log_interval == 0 or i == total_iter - 1:
-            # save the loss
-            loss_dict[i] = loss.item()
-
-            # save the image
-            img = sds.decode_latents(latents.detach())
-            output_im = Image.fromarray(img.astype("uint8"))
-            output_path = os.path.join(
-                sds.output_dir,
-                f"output_{prompt[0].replace(' ', '_')}_iter_{i}.png",
+            # Initialize optimizer
+            optimizer.zero_grad()
+            # experiment iterations ratio
+            # i.e. what proportion of this experiment have we completed (in terms of iterations) so far?
+            exp_iter_ratio = (global_step - args.exp_start_iter) / (
+                args.exp_end_iter - args.exp_start_iter
             )
-            output_im.save(output_path)
 
-    if save_mesh:
-        render_360_views(
-            mesh.detach(),
-            renderer,
-            device=device,
-            output_path=osp.join(sds.output_dir, f"final_mesh.gif"),
-        )
+            # Load the data
+            rays_o = data["rays_o"]  # [B, N, 3]
+            rays_d = data["rays_d"]  # [B, N, 3]
+            mvp = data["mvp"]  # [B, 4, 4]
+
+            B, N = rays_o.shape[:2]
+            H, W = data["H"], data["W"]
+            assert B == 1, "Batch size should be 1"
+
+            # When ref_data has B images > args.batch_size
+            if B > args.batch_size:
+                # choose batch_size images out of those B images
+                choice = torch.randperm(B)[: args.batch_size]
+                B = args.batch_size
+                rays_o = rays_o[choice]
+                rays_d = rays_d[choice]
+                mvp = mvp[choice]
+
+            # Set the shading and background color for rendering
+            if exp_iter_ratio <= args.latent_iter_ratio:
+                ambient_ratio = 1.0
+                shading = "normal"
+                bg_color = None
+
+            else:
+                # random shading
+                ambient_ratio = (
+                    args.min_ambient_ratio
+                    + (1.0 - args.min_ambient_ratio) * random.random()
+                )
+                rand = random.random()
+                if rand >= (1.0 - args.textureless_ratio):
+                    shading = "textureless"
+                else:
+                    shading = "lambertian"
+
+                # random background
+                rand = random.random()
+                if args.bg_radius > 0 and rand > 0.5:
+                    bg_color = None  # use bg_net
+                else:
+                    bg_color = torch.rand(3).to(device)  # single color random bg
+
+            # Forward pass to render NeRF model
+            outputs = model.render(
+                rays_o,
+                rays_d,
+                mvp,
+                H,
+                W,
+                staged=False,
+                perturb=True,
+                bg_color=bg_color,
+                ambient_ratio=ambient_ratio,
+                shading=shading,
+                binarize=False,
+                max_ray_batch=args.max_ray_batch,
+            )
+            pred_rgb = (
+                outputs["image"].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+            )  # [B, 3, H, W]
+
+            # Compuate the loss
+            # interpolate text_z
+            azimuth = data["azimuth"]  # [-180, 180]
+            assert azimuth.shape[0] == 1, "Batch size should be 1"
+            text_uncond = embeddings["uncond"]
+
+            if not args.view_dep_text:
+                text_cond = embeddings["default"]
+            else:
+                ### YOUR CODE HERE ###
+                # from prepare_embeddings:
+
+                # if view_dependent:
+                #     for d in ["front", "side", "back"]:
+                #         embeddings[d] = sds.get_text_embeddings([f"{prompt}, {d} view"])
+
+                if -45 <= azimuth <= 45:
+                    text_cond = embeddings["front"]
+                elif 45 < azimuth <= 135:
+                    text_cond = embeddings["side"]
+                elif -135 <= azimuth < -45:
+                    text_cond = embeddings["side"]
+                else:
+                    text_cond = embeddings["back"]
+
+  
+            ### YOUR CODE HERE ###
+
+            pred_rgb_resized = torch.nn.functional.interpolate(pred_rgb, size=(512, 512), mode="bilinear", align_corners=False)
+            latents = sds.encode_imgs(pred_rgb_resized)
+            loss = sds.sds_loss(latents, text_cond, text_uncond)
+
+            
+
+            # regularizations
+            if args.lambda_entropy > 0:
+                alphas = outputs["weights"].clamp(1e-5, 1 - 1e-5)
+                # alphas = alphas ** 2 # skewed entropy, favors 0 over 1
+                loss_entropy = (
+                    -alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)
+                ).mean()
+                lambda_entropy = args.lambda_entropy * min(
+                    1, 2 * global_step / args.iters
+                )
+                loss = loss + lambda_entropy * loss_entropy
+
+            if args.lambda_orient > 0 and "loss_orient" in outputs:
+                loss_orient = outputs["loss_orient"]
+                loss = loss + args.lambda_orient * loss_orient
+
+            # Backward pass
+            if args.loss_scaling:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            lr_scheduler.step()
+
+            # Log
+            print(f"Epoch {epoch}, global_step {global_step}, loss {loss.item()}")
+            if global_step % 100 == 0:
+                loss_dict[global_step] = loss.item()
+                # save the nerf rendering as the logging output, instead of the decoded latent
+                imgs = (
+                    pred_rgb.detach().cpu().permute(0, 2, 3, 1).numpy()
+                )  # torch to numpy, shape [1, 512, 512, 3]
+                imgs = (imgs * 255).round()  # [0, 1] => [0, 255]
+                rgb = Image.fromarray(imgs[0].astype("uint8"))
+                output_path = (
+                    f"{sds.output_dir}/images/rgb_epoch_{epoch}_iter_{global_step}.png"
+                )
+                rgb.save(output_path)
+
+        # Save checkpoint
+        if epoch % log_interval == 0 and global_step > 0:
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                },
+                checkpoint_path,
+            )
+
+        if epoch % log_interval == 0 or epoch == max_epoch - 1:
+            model.eval()
+            all_preds = []
+            all_preds_depth = []
+
+            print(f"Epoch {epoch}, testing and save rgb and depth to video...")
+
+            with torch.no_grad():
+                for i, data in enumerate(test_loader):
+                    rays_o = data["rays_o"]  # [B, N, 3]
+                    rays_d = data["rays_d"]  # [B, N, 3]
+                    mvp = data["mvp"]
+
+                    B, N = rays_o.shape[:2]
+                    H, W = data["H"], data["W"]
+
+                    if bg_color is not None:
+                        bg_color = bg_color.to(rays_o.device)
+
+                    shading = data["shading"] if "shading" in data else "albedo"
+                    ambient_ratio = (
+                        data["ambient_ratio"] if "ambient_ratio" in data else 1.0
+                    )
+                    light_d = data["light_d"] if "light_d" in data else None
+
+                    outputs = model.render(
+                        rays_o,
+                        rays_d,
+                        mvp,
+                        H,
+                        W,
+                        staged=True,
+                        perturb=False,
+                        light_d=light_d,
+                        ambient_ratio=ambient_ratio,
+                        shading=shading,
+                        bg_color=bg_color,
+                    )
+
+                    preds = outputs["image"].reshape(B, H, W, 3)
+                    preds_depth = outputs["depth"].reshape(B, H, W)
+
+                    pred = preds[0].detach().cpu().numpy()
+                    pred = (pred * 255).astype(np.uint8)
+
+                    pred_depth = preds_depth[0].detach().cpu().numpy()
+                    pred_depth = (pred_depth - pred_depth.min()) / (
+                        pred_depth.max() - pred_depth.min() + 1e-6
+                    )
+                    pred_depth = (pred_depth * 255).astype(np.uint8)
+
+                    all_preds.append(pred)
+                    all_preds_depth.append(pred_depth)
+            all_preds = np.stack(all_preds, axis=0)
+            all_preds_depth = np.stack(all_preds_depth, axis=0)
+            # save the video
+            imageio.mimwrite(
+                os.path.join(sds.output_dir, "videos", f"rgb_ep_{epoch}.gif"),
+                all_preds,
+                fps=25,
+                quality=8,
+                macro_block_size=1,
+                loop=0,
+            )
+            imageio.mimwrite(
+                os.path.join(sds.output_dir, "videos", f"depth_ep_{epoch}.gif"),
+                all_preds_depth,
+                fps=25,
+                quality=8,
+                macro_block_size=1,
+                loop=0,
+            )
 
 
 if __name__ == "__main__":
@@ -142,26 +315,37 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="a hamburger")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="output")
-    parser.add_argument(
-        "--postfix",
-        type=str,
-        default="",
-        help="postfix for the output directory to differentiate multiple runs",
-    )
+    parser.add_argument("--loss_scaling", type=int, default=1)
+
+    ### YOUR CODE HERE ###
+    # You wil need to tune the following parameters to obtain good NeRF results
+    ### regularizations
+    parser.add_argument('--lambda_entropy', type=float, default=1e-4, help="loss scale for alpha entropy")
+    parser.add_argument('--lambda_orient', type=float, default=1e-3, help="loss scale for orientation")
+    ### shading options
+    parser.add_argument('--latent_iter_ratio', type=float, default=0.2, help="training iters that only use albedo shading")
+
 
     parser.add_argument(
-        "-m",
-        "--mesh_path",
-        type=str,
-        default="data/cow.obj",
-        help="Path to the input image",
+        "--postfix", type=str, default="", help="Postfix for the output directory"
     )
+    parser.add_argument(
+        "--view_dep_text",
+        type=int,
+        default=0,
+        help="option to use view dependent text embeddings for nerf optimization",
+    )
+
+    parser = add_config_arguments(
+        parser
+    )  # add additional arguments for nerf optimization, You don't need to change the setting here by default
+
     args = parser.parse_args()
 
     seed_everything(args.seed)
 
     # create output directory
-    args.output_dir = osp.join(args.output_dir, "mesh")
+    args.output_dir = osp.join(args.output_dir, "nerf")
     output_dir = os.path.join(
         args.output_dir, args.prompt.replace(" ", "_") + args.postfix
     )
@@ -171,12 +355,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sds = SDS(sd_version="2.1", device=device, output_dir=output_dir)
 
-    # optimize the texture map of a mesh
+    # optimize a NeRF model
     start_time = time.time()
-    assert (
-        args.mesh_path is not None
-    ), "mesh_path should be provided for optimizing the texture map for a mesh"
-    optimize_mesh_texture(
-        sds, mesh_path=args.mesh_path, prompt=args.prompt, device=device, args=args
-    )
+    optimize_nerf(sds, prompt=args.prompt, device=device, args=args)
     print(f"Optimization took {time.time() - start_time:.2f} seconds")

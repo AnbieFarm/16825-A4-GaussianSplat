@@ -1,6 +1,6 @@
 setup.py
-/data/ruihan/16825/a4_internal/Q2/stable-dreamfusion/gridencoder/src/bindings.cpp
-/data/ruihan/16825/a4_internal/Q2/stable-dreamfusion/gridencoder/src/gridencoder.cu
+/home/ubuntu/assignment4/Q2/gridencoder/src/bindings.cpp
+/home/ubuntu/assignment4/Q2/gridencoder/src/gridencoder.cu
 gridencoder.egg-info/PKG-INFO
 gridencoder.egg-info/SOURCES.txt
 gridencoder.egg-info/dependency_links.txt

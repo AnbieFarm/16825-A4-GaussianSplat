@@ -1,3 +1,5 @@
 # ninja log v5
 0	9882	1707064551739982795	/data/ruihan/16825/a4_internal/Q2/stable-dreamfusion/freqencoder/build/temp.linux-x86_64-cpython-310/data/ruihan/16825/a4_internal/Q2/stable-dreamfusion/freqencoder/src/bindings.o	dd1839430168d104
 0	30361	1707064572220307091	/data/ruihan/16825/a4_internal/Q2/stable-dreamfusion/freqencoder/build/temp.linux-x86_64-cpython-310/data/ruihan/16825/a4_internal/Q2/stable-dreamfusion/freqencoder/src/freqencoder.o	8fe69fd0981553de
+5	22258	1743139608418265556	/home/ubuntu/assignment4/Q2/freqencoder/build/temp.linux-x86_64-cpython-310/home/ubuntu/assignment4/Q2/freqencoder/src/bindings.o	47e86d0f8ab0d6c3
+5	58074	1743139644238222681	/home/ubuntu/assignment4/Q2/freqencoder/build/temp.linux-x86_64-cpython-310/home/ubuntu/assignment4/Q2/freqencoder/src/freqencoder.o	691a3d0af08331d6

@@ -152,5 +152,6 @@ def prepare_embeddings(sds, prompt, neg_prompt="", view_dependent=False):
     embeddings["uncond"] = sds.get_text_embeddings(neg_prompt)  # shape [1, 77, 1024]
     if view_dependent:
         for d in ["front", "side", "back"]:
-            embeddings[d] = sds.get_text_embeddings([f"{prompt}, {d} view"])
+            # TODO: AH: added[0] to below so that '[]' are not passed to encoder!
+            embeddings[d] = sds.get_text_embeddings([f"{prompt[0]}, {d} view"])
     return embeddings

@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
+from torch.nn import MSELoss
 from diffusers import DDIMScheduler, StableDiffusionPipeline
+#import lpips
 
 
 class SDS:
@@ -62,6 +64,9 @@ class SDS:
 
         print(f"[INFO] loaded stable diffusion!")
 
+        # Add Perpetual loss fn
+        #self.lpips_loss_fn = lpips.LPIPS(net='alex').to('cpu')
+
     @torch.no_grad()
     def get_text_embeddings(self, prompt):
         """
@@ -70,12 +75,15 @@ class SDS:
         Args:
             prompt (list of string): text prompt to encode.
         """
+        # print('here')
         text_input = self.tokenizer(
             prompt,
             padding="max_length",
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt",
+            #padding=True, # TODO: AH: can we remove this line?
         )
+        
         text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
         return text_embeddings
 
@@ -117,13 +125,16 @@ class SDS:
         imgs = (imgs * 255).round()  # [0, 1] => [0, 255]
         return imgs[0]
 
+
     def sds_loss(
         self,
-        latents,
+        latents, # latents 
         text_embeddings,
         text_embeddings_uncond=None,
         guidance_scale=100,
         grad_scale=1,
+        pixel_space_loss=0,
+        pred_rgb=None,
     ):
         """
         Compute the SDS loss.
@@ -148,22 +159,53 @@ class SDS:
             device=self.device,
         )
 
+        self.scheduler.set_timesteps(self.num_inference_steps)
+
         # predict the noise residual with unet, NO grad!
         with torch.no_grad():
             ### YOUR CODE HERE ###
- 
+            # 1. Add noise to latent space
+            std_normal_noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, std_normal_noise, t)
 
+            # 2. Use unet to predict/recover noise added while conditioning on the text prompt 
+            pred_noise_cond = self.unet(latents_noisy, t, encoder_hidden_states=text_embeddings).sample
+ 
             if text_embeddings_uncond is not None and guidance_scale != 1:
                 ### YOUR CODE HERE ###
-                pass
+                # 3. (optional:) Bias the predicted noise towards the conditioning.
+                pred_noise_uncond = self.unet(latents_noisy, t, encoder_hidden_states=text_embeddings_uncond).sample
+                pred_noise = pred_noise_cond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
+            else:
+                pred_noise = pred_noise_cond
  
+        if not pixel_space_loss:
+            # 4. Compute noise residual 
+            noise_residual = pred_noise - std_normal_noise
 
+            # Compute SDS loss
+            # 5. Compute log-likelihood gradient using noise residual
+            w = 1 - self.alphas[t]
+            log_p_grad = w * noise_residual
 
-        # Compute SDS loss
-        w = 1 - self.alphas[t]
-        ### YOUR CODE HERE ###
+            # 6. Create proxy loss that makes the gradient equal to the distillation score
+            target_latents = (latents - torch.nan_to_num(grad_scale * log_p_grad)).detach()
 
+            # 7. Use different loss fn depending on whether SDS loss is computed in pixel space or latent space. 
+            #loss = MSELoss(reduction='sum')(latents, target_latents) / latents.shape[0]
+            loss = F.mse_loss(target_latents, latents)
+        else:
+            # 4. Denoise latents using the predicted (guided) noise
+            denoised_latents = self.scheduler.step(pred_noise, t, latents_noisy).pred_original_sample
 
-        loss = 
+            # 5. Decode the denoised latents
+            decoded_denoised_rgb = self.decode_latents(denoised_latents.detach())
+
+            # 6. Compute loss between the pred_rgb and the decoded_denoised_rgb
+                    # Use AMP for LPIPS to save memory
+            #torch.cuda.empty_cache() 
+            #with torch.cuda.amp.autocast():
+            #    loss = self.lpips_loss_fn(decoded_denoised_rgb, pred_rgb).mean()
+            loss = F.mse_loss(decoded_denoised_rgb, pred_rgb)
 
         return loss
